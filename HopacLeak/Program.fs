@@ -33,7 +33,7 @@ module Worker =
           Load: int }
         member x.IsFull = x.Load >= x.Capacity
 
-    let spawn (slotId: SlotId) (input: Alt<Task>) (capacity: int) =
+    let spawn (input: Alt<Task>) (capacity: int) =
         let resultCh = Ch()
         let getStateCh = Ch()
 
@@ -66,24 +66,6 @@ module Worker =
                      |> queue 
                      state
                 )
-//                (input ^=> fun task ->
-//                     let state = { state with Load = state.Load + 1 }
-//                     Job.tryInDelay 
-//                         (fun _ -> 
-//                            job { 
-//                                return 
-//                                    { ExtractedFiles = 
-//                                        if task.File.Depth < 5 then 
-//                                            [ { Id = task.File.Id; Depth = task.File.Depth + 1 } 
-//                                              { Id = task.File.Id; Depth = task.File.Depth + 1 } ] 
-//                                        else [] }
-//                            })
-//                         (IVar.fill task.Result)
-//                         (IVar.fillFailure task.Result)
-//                     >>=. resultCh *<+ ()
-//                     |> Job.queue
-//                     >>-. state
-//                )
                 <|>
                 resultAlt
             )
@@ -126,13 +108,13 @@ module SlotTaskPool =
 
 type TaskPool =
     { Add: Task -> Job<unit>
-      CreateSource: SlotId -> Alt<Task> }
+      CreateSource: unit -> Alt<Task> }
 
 [<CompilationRepresentation(CompilationRepresentationFlags.ModuleSuffix)>]
 module TaskPool =
-    let create slots = 
+    let create() = 
         let slotTaskPools = 
-            slots |> Seq.map (fun slot -> slot, SlotTaskPool.create slot) |> Map.ofSeq
+            [1; 2] |> Seq.map SlotId |> Seq.map (fun slot -> slot, SlotTaskPool.create slot) |> Map.ofSeq
         
         { Add = fun task -> 
             match slotTaskPools |> Map.tryFind task.SlotId with
@@ -141,17 +123,18 @@ module TaskPool =
                 printfn "Slot with id = %A was not found, task has lost" task.SlotId
                 Job.result()
           
-          CreateSource = fun slotId ->
+          CreateSource = fun () ->
             slotTaskPools |> Map.toList |> List.map (fun (_, x) -> x.Get) |> Alt.choose }
 
-type AsyncExtractor(slots: SlotId seq) =
-    let taskPool = TaskPool.create slots
+type AsyncExtractor() =
+    let taskPool = TaskPool.create()
+    
     let workers = 
-        slots 
-        |> Seq.map (fun slot -> Worker.spawn slot (taskPool.CreateSource slot) 10)
-        |> Seq.toList
+        [ Worker.spawn (taskPool.CreateSource()) 10
+          Worker.spawn (taskPool.CreateSource()) 10 ]
+
     member __.Perform (task: Task) = taskPool.Add task >>=. task.Result
-    member __.GetState() = Job.conCollect workers >>- Seq.toList
+    member __.GetState() = workers |> Job.conCollect >>- Seq.toArray
 
 module Unpacker =
     let unpackOneLevel (asyncExecutor: AsyncExtractor) (file: File) : UnpackResult Job =
@@ -163,7 +146,7 @@ module Unpacker =
                   Result = IVar() }
 
             let! result = asyncExecutor.Perform task
-            let saveFile (file: File) : byte array Job = job { return [||] }
+            let saveFile (_: File) : byte array Job = job { return [||] }
                 
             let! children =
                     result.ExtractedFiles
@@ -227,7 +210,7 @@ module Top =
 
 [<EntryPoint>]
 let main _ = 
-    let executor = AsyncExtractor [SlotId 1; SlotId 2]
+    let executor = AsyncExtractor()
     for id in 1..1000000 do
         printfn "Press a key to process a task with id = %d" id
         Console.ReadKey() |> ignore
